@@ -1,0 +1,72 @@
+# Pipeline Configuration
+# Tune self-healing behaviour without editing workflow files.
+
+pipeline:
+  # ── Retry settings ──────────────────────────────────────────────────────
+  retry:
+    max_attempts: 3           # Maximum number of retry attempts per job
+    wait_seconds: 30          # Base wait time between retries (seconds)
+    backoff_multiplier: 2     # Exponential back-off multiplier
+
+  # ── Health check settings ────────────────────────────────────────────────
+  health_check:
+    retries: 5                # Number of polling attempts
+    interval_seconds: 15      # Time between polling attempts
+    timeout_seconds: 30       # Per-request timeout
+    expected_http_status: 200 # Expected HTTP response code
+    path: /health             # Health-check endpoint path
+
+  # ── Rollback settings ────────────────────────────────────────────────────
+  rollback:
+    enabled: true             # Enable automatic rollback on health-check failure
+    strategy: previous_sha    # Options: previous_sha | tagged_release
+
+  # ── Flaky test settings ──────────────────────────────────────────────────
+  flaky_tests:
+    enabled: true             # Re-run failing tests once to detect flakiness
+    rerun_count: 1            # Times to re-run before marking as truly failed
+
+  # ── Notification settings ────────────────────────────────────────────────
+  notifications:
+    # Set NOTIFY_WEBHOOK_URL as a GitHub Actions secret.
+    # Supports Slack incoming webhooks and Microsoft Teams connectors.
+    on_rollback: true
+    on_issue_opened: true
+    on_successful_deploy: true
+    on_auto_retry: true
+
+  # ── Failure classification ───────────────────────────────────────────────
+  classification:
+    transient_patterns:
+      - "network"
+      - "timeout"
+      - "connection refused"
+      - "rate limit"
+      - "ETIMEDOUT"
+      - "ECONNRESET"
+      - "503"
+      - "504"
+    dependency_patterns:
+      - "npm audit"
+      - "package not found"
+      - "peer dep"
+      - "dependency resolution"
+    infrastructure_patterns:
+      - "runner"
+      - "out of memory"
+      - "disk full"
+      - "permission denied"
+
+# ── Environments ─────────────────────────────────────────────────────────────
+environments:
+  staging:
+    url_var: STAGING_URL           # GitHub Actions variable name
+    deploy_timeout_minutes: 20
+    health_check_retries: 5
+
+  production:
+    url_var: PRODUCTION_URL        # GitHub Actions variable name
+    deploy_timeout_minutes: 30
+    health_check_retries: 5
+    requires_approval: true        # GitHub environment protection rule
+    deployment_strategy: blue-green

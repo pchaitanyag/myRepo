@@ -1,0 +1,225 @@
+# Self-Healing Orchestrator
+# Triggered whenever ANY workflow in this repository fails.
+# Self-healing actions:
+#   1. Classify the failure (transient, test, dependency, infrastructure)
+#   2. Attempt automatic remediation based on classification
+#   3. Open a GitHub Issue if automatic remediation is not possible
+#   4. Notify the on-call team
+
+name: Self-Heal
+
+on:
+  workflow_run:
+    workflows: ["CI", "CD", "Dependency Scan"]
+    types: [completed]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  triage:
+    name: Triage Failure
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'failure'
+    outputs:
+      failure-type: ${{ steps.classify.outputs.type }}
+      run-id: ${{ github.event.workflow_run.id }}
+      workflow-name: ${{ github.event.workflow_run.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download failure logs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = context.payload.workflow_run.id;
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+            const failedJobs = jobs.data.jobs
+              .filter(j => j.conclusion === 'failure')
+              .map(j => ({
+                name: j.name,
+                steps: j.steps
+                  .filter(s => s.conclusion === 'failure')
+                  .map(s => s.name)
+              }));
+            console.log('Failed jobs:', JSON.stringify(failedJobs, null, 2));
+            core.exportVariable('FAILED_JOBS', JSON.stringify(failedJobs));
+
+      - name: Classify failure
+        id: classify
+        run: |
+          bash scripts/classify-failure.sh "$FAILED_JOBS"
+
+  # ── Auto-remediation: re-run transient failures ──────────────────────────
+  rerun-on-transient:
+    name: Re-run (transient failure)
+    runs-on: ubuntu-latest
+    needs: triage
+    if: needs.triage.outputs.failure-type == 'transient'
+    steps:
+      - name: Re-trigger failed workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = Number("${{ needs.triage.outputs.run-id }}");
+            await github.rest.actions.reRunFailedJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+            console.log(`Re-triggered run ${runId}`);
+
+      - name: Notify – auto-retry
+        run: |
+          bash scripts/notify.sh \
+            --level "info" \
+            --message "Self-Heal: transient failure detected in '${{ needs.triage.outputs.workflow-name }}' – automatically re-running." \
+            --webhook "${{ secrets.NOTIFY_WEBHOOK_URL }}"
+
+  # ── Auto-remediation: fix dependency issues ───────────────────────────────
+  fix-dependencies:
+    name: Fix Dependencies
+    runs-on: ubuntu-latest
+    needs: triage
+    if: needs.triage.outputs.failure-type == 'dependency'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Attempt npm audit fix
+        id: fix
+        run: |
+          npm audit fix --force || true
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR with fixes
+        if: steps.fix.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: self-heal/dependency-fix-${{ github.run_id }}
+          commit-message: "fix(deps): self-heal dependency vulnerabilities [skip ci]"
+          title: "🩹 Self-Heal: Fix dependency vulnerabilities"
+          body: |
+            ## Self-Healing: Dependency Fix
+
+            This PR was created automatically by the **Self-Heal** workflow after
+            detecting a dependency failure in the CI pipeline.
+
+            ### Changes
+            - `npm audit fix --force` was applied to resolve vulnerable packages.
+
+            ### Review Checklist
+            - [ ] Review changed packages for breaking changes
+            - [ ] Run tests locally before merging
+            - [ ] Verify no unintended upgrades were applied
+
+            _Triggered by workflow run [${{ needs.triage.outputs.run-id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ needs.triage.outputs.run-id }})_
+          labels: |
+            self-heal
+            dependencies
+            automated
+
+      - name: Notify
+        run: |
+          bash scripts/notify.sh \
+            --level "warning" \
+            --message "Self-Heal: dependency failure detected – auto-fix PR opened." \
+            --webhook "${{ secrets.NOTIFY_WEBHOOK_URL }}"
+
+  # ── Escalation: open an issue for unresolvable failures ──────────────────
+  open-issue:
+    name: Open Issue (escalation)
+    runs-on: ubuntu-latest
+    needs: triage
+    if: >
+      needs.triage.outputs.failure-type == 'infrastructure' ||
+      needs.triage.outputs.failure-type == 'unknown' ||
+      needs.triage.outputs.failure-type == 'test'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Collect log excerpt
+        uses: actions/github-script@v7
+        id: logs
+        with:
+          script: |
+            const runId = Number("${{ needs.triage.outputs.run-id }}");
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+            const summary = jobs.data.jobs
+              .filter(j => j.conclusion === 'failure')
+              .map(j => `**Job:** ${j.name}\n**Steps failed:** ${j.steps.filter(s=>s.conclusion==='failure').map(s=>s.name).join(', ')}`)
+              .join('\n\n');
+            return summary;
+          result-encoding: string
+
+      - name: Create GitHub Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🚨 Pipeline failure: ${{ needs.triage.outputs.workflow-name }} (run #${{ needs.triage.outputs.run-id }})`;
+            const body = [
+              '## Pipeline Failure Report',
+              '',
+              `**Workflow:** ${{ needs.triage.outputs.workflow-name }}`,
+              `**Failure type:** ${{ needs.triage.outputs.failure-type }}`,
+              `**Run ID:** [${{ needs.triage.outputs.run-id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ needs.triage.outputs.run-id }})`,
+              `**SHA:** ${{ github.sha }}`,
+              `**Branch:** ${{ github.ref_name }}`,
+              '',
+              '## Failed Jobs',
+              '',
+              `${{ steps.logs.outputs.result }}`,
+              '',
+              '## Self-Healing Actions Taken',
+              '',
+              '- Automatic retry: **not applicable** (failure type: `${{ needs.triage.outputs.failure-type }}`)',
+              '- Automatic fix: **not applicable**',
+              '- **Manual intervention required**',
+              '',
+              '## Next Steps',
+              '',
+              '1. Review the [failed run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ needs.triage.outputs.run-id }})',
+              '2. Identify root cause',
+              '3. Apply fix and re-run the pipeline',
+              '4. Close this issue once resolved',
+            ].join('\n');
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['pipeline-failure', 'self-heal', 'needs-triage'],
+            });
+            console.log(`Issue created: ${issue.data.html_url}`);
+
+      - name: Notify on-call
+        run: |
+          bash scripts/notify.sh \
+            --level "error" \
+            --message "Self-Heal ESCALATION: '${{ needs.triage.outputs.workflow-name }}' failed (type: ${{ needs.triage.outputs.failure-type }}). Manual intervention required. GitHub Issue opened." \
+            --webhook "${{ secrets.NOTIFY_WEBHOOK_URL }}"
