@@ -1,0 +1,115 @@
+# Dependency Scan Workflow
+# Self-healing features:
+#   • Weekly automated dependency vulnerability scan
+#   • Automatically opens a PR with fixes for high/critical issues
+#   • Labels PRs and issues for tracking
+
+name: Dependency Scan
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # Every Monday at 03:00 UTC
+  push:
+    paths:
+      - "package.json"
+      - "package-lock.json"
+      - "requirements.txt"
+      - "Pipfile.lock"
+      - "go.sum"
+      - "pom.xml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write
+
+jobs:
+  scan-npm:
+    name: Scan npm Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: npm ci --prefer-offline || npm install
+
+      - name: Run npm audit
+        id: audit
+        run: |
+          npm audit --json > /tmp/audit-report.json 2>&1 || true
+          VULN_COUNT=$(jq '.metadata.vulnerabilities | (.high // 0) + (.critical // 0)' /tmp/audit-report.json 2>/dev/null || echo "0")
+          echo "vuln-count=$VULN_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Vulnerabilities (high/critical): $VULN_COUNT"
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-${{ github.run_id }}
+          path: /tmp/audit-report.json
+          retention-days: 30
+
+      - name: Attempt automated fix
+        id: fix
+        if: steps.audit.outputs.vuln-count != '0'
+        run: |
+          npm audit fix --force || true
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes made by npm audit fix"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Dependencies updated"
+          fi
+
+      - name: Create fix PR
+        if: steps.fix.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: self-heal/dep-scan-fix-${{ github.run_id }}
+          commit-message: "fix(deps): auto-fix ${{ steps.audit.outputs.vuln-count }} npm vulnerabilities [skip ci]"
+          title: "🔒 Dependency Scan: Fix ${{ steps.audit.outputs.vuln-count }} vulnerabilities"
+          body: |
+            ## Automated Dependency Vulnerability Fix
+
+            This PR was created automatically by the **Dependency Scan** workflow.
+
+            **Vulnerabilities found (high/critical):** ${{ steps.audit.outputs.vuln-count }}
+
+            ### Changes
+            `npm audit fix --force` was applied. Please review the diff carefully for
+            any unintended major-version upgrades that may introduce breaking changes.
+
+            ### Review Checklist
+            - [ ] No unexpected major-version upgrades
+            - [ ] Tests pass locally
+            - [ ] CHANGELOG updated if necessary
+
+            ### Audit Report
+            See the `npm-audit-${{ github.run_id }}` artifact attached to [this run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          labels: |
+            security
+            dependencies
+            self-heal
+            automated
+          assignees: ${{ github.repository_owner }}
+
+      - name: Notify if vulnerabilities remain
+        if: steps.audit.outputs.vuln-count != '0' && steps.fix.outputs.changed != 'true'
+        run: |
+          bash scripts/notify.sh \
+            --level "warning" \
+            --message "Dependency Scan: ${{ steps.audit.outputs.vuln-count }} high/critical vulnerabilities found but could not be auto-fixed. Manual review required." \
+            --webhook "${{ secrets.NOTIFY_WEBHOOK_URL }}"

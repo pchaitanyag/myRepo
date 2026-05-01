@@ -1,0 +1,238 @@
+# CI Workflow – Build, Test, and Lint
+# Self-healing features:
+#   • Automatic retry (up to 3 attempts) for every job
+#   • Flaky-test detection: failed tests are re-run in isolation
+#   • Step-level caching to prevent transient download failures
+
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop", "release/**"]
+  pull_request:
+    branches: ["main", "develop"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  # ── 1. Dependency installation (cached) ─────────────────────────────────────
+  install:
+    name: Install dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      cache-hit: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Cache node_modules
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install (with retry)
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: npm ci
+
+  # ── 2. Lint ──────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    needs: install
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Run lint (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 2
+          command: npm run lint --if-present
+
+  # ── 3. Build ─────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: install
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Build (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 20
+          command: npm run build --if-present
+
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: dist/
+          retention-days: 7
+
+  # ── 4. Test (with flaky-test detection) ──────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: [lint, build]
+    permissions:
+      contents: read
+    outputs:
+      tests-passed: ${{ steps.final-status.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Run tests (attempt 1)
+        id: test-attempt-1
+        continue-on-error: true
+        run: npm test --if-present -- --ci --reporters=default --reporters=jest-junit
+        env:
+          JEST_JUNIT_OUTPUT_DIR: test-results/attempt-1
+
+      - name: Re-run only failed tests (flaky-test detection)
+        id: test-attempt-2
+        if: steps.test-attempt-1.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "::warning::Some tests failed on first attempt – re-running to detect flakiness"
+          npm test --if-present -- --ci --onlyFailures --reporters=default --reporters=jest-junit
+        env:
+          JEST_JUNIT_OUTPUT_DIR: test-results/attempt-2
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.sha }}
+          path: test-results/
+          retention-days: 14
+
+      - name: Mark flaky tests
+        if: steps.test-attempt-1.outcome == 'failure' && steps.test-attempt-2.outcome == 'success'
+        run: |
+          echo "::warning::Flaky tests detected – passed on second attempt. Review test-results artifacts."
+
+      - name: Final status
+        id: final-status
+        run: |
+          if [ "${{ steps.test-attempt-1.outcome }}" == "success" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.test-attempt-2.outcome }}" == "success" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Tests failed on both attempts – manual intervention required."
+            exit 1
+          fi
+
+  # ── 5. Security scan ─────────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: install
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Audit dependencies (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 10
+          command: npm audit --audit-level=high --if-present || true
+
+  # ── 6. CI gate ───────────────────────────────────────────────────────────────
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: always()
+    permissions: {}
+    steps:
+      - name: Evaluate gate
+        run: |
+          TEST_RESULT="${{ needs.test.result }}"
+          SEC_RESULT="${{ needs.security.result }}"
+
+          echo "Test result : $TEST_RESULT"
+          echo "Security result: $SEC_RESULT"
+
+          if [ "$TEST_RESULT" != "success" ]; then
+            echo "::error::CI Gate FAILED – tests did not pass."
+            exit 1
+          fi
+
+          echo "CI Gate PASSED"

@@ -1,0 +1,246 @@
+# CD Workflow – Deploy with Health Checks and Auto-Rollback
+# Self-healing features:
+#   • Deployment retries with exponential back-off
+#   • Automated health checks after every deployment
+#   • Automatic rollback when health checks fail
+#   • Deployment state tracking via GitHub deployments API
+#   • Slack/Teams notification on rollback
+
+name: CD
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: ["main"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      force_rollback:
+        description: "Force rollback to previous version"
+        required: false
+        default: "false"
+        type: boolean
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a running deployment
+
+env:
+  HEALTH_CHECK_RETRIES: "5"
+  HEALTH_CHECK_INTERVAL: "15"   # seconds between health-check attempts
+  ROLLBACK_ON_FAILURE: "true"
+
+jobs:
+  # ── Guard: only deploy when CI passed ──────────────────────────────────────
+  gate:
+    name: Deployment Gate
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success')
+    permissions: {}
+    outputs:
+      should-deploy: ${{ steps.check.outputs.deploy }}
+    steps:
+      - name: Check CI conclusion
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.workflow_run.conclusion }}" == "success" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "::error::CI did not succeed – skipping deployment."
+          fi
+
+  # ── Staging deployment ────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: gate
+    if: needs.gate.outputs.should-deploy == 'true'
+    permissions:
+      contents: read
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    outputs:
+      previous-sha: ${{ steps.record.outputs.previous-sha }}
+      deploy-status: ${{ steps.health.outputs.status }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: dist/
+        continue-on-error: true   # artifact may not exist for manual runs
+
+      - name: Record previous SHA (for rollback)
+        id: record
+        run: |
+          PREV=$(git rev-parse HEAD~1 2>/dev/null || echo "none")
+          echo "previous-sha=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Previous SHA recorded: $PREV"
+
+      - name: Deploy to Staging (with retry)
+        id: deploy
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: bash scripts/deploy.sh staging ${{ github.sha }}
+
+      - name: Wait for service warm-up
+        run: sleep 10
+
+      - name: Run health checks
+        id: health
+        run: |
+          bash scripts/health-check.sh \
+            --url "${{ vars.STAGING_URL }}" \
+            --retries "${{ env.HEALTH_CHECK_RETRIES }}" \
+            --interval "${{ env.HEALTH_CHECK_INTERVAL }}" \
+            --sha "${{ github.sha }}"
+          echo "status=healthy" >> "$GITHUB_OUTPUT"
+
+      - name: Rollback if health checks failed
+        if: failure() && env.ROLLBACK_ON_FAILURE == 'true'
+        run: |
+          echo "::error::Health checks failed – initiating rollback."
+          bash scripts/rollback.sh staging "${{ steps.record.outputs.previous-sha }}"
+
+      - name: Notify on rollback
+        if: failure()
+        run: |
+          bash scripts/notify.sh \
+            --level "error" \
+            --message "Staging deployment ROLLED BACK for SHA ${{ github.sha }}. Previous SHA: ${{ steps.record.outputs.previous-sha }}" \
+            --webhook "${{ secrets.NOTIFY_WEBHOOK_URL }}"
+
+  # ── Production deployment ─────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: >
+      needs.deploy-staging.outputs.deploy-status == 'healthy' &&
+      (github.ref == 'refs/heads/main' || github.event.inputs.environment == 'production')
+    permissions:
+      contents: read
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    outputs:
+      previous-sha: ${{ steps.record.outputs.previous-sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: dist/
+        continue-on-error: true
+
+      - name: Record previous SHA (for rollback)
+        id: record
+        run: |
+          PREV=$(git rev-parse HEAD~1 2>/dev/null || echo "none")
+          echo "previous-sha=$PREV" >> "$GITHUB_OUTPUT"
+
+      - name: Blue/Green switch – pre-flight
+        run: |
+          echo "Switching traffic to new version ${{ github.sha }}"
+          bash scripts/deploy.sh production ${{ github.sha }} --strategy=blue-green --phase=pre
+
+      - name: Deploy to Production (with retry)
+        id: deploy
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_wait_seconds: 60
+          command: bash scripts/deploy.sh production ${{ github.sha }} --strategy=blue-green --phase=swap
+
+      - name: Wait for service warm-up
+        run: sleep 20
+
+      - name: Run health checks (production)
+        id: health
+        run: |
+          bash scripts/health-check.sh \
+            --url "${{ vars.PRODUCTION_URL }}" \
+            --retries "${{ env.HEALTH_CHECK_RETRIES }}" \
+            --interval "${{ env.HEALTH_CHECK_INTERVAL }}" \
+            --sha "${{ github.sha }}"
+
+      - name: Rollback if health checks failed
+        if: failure() && env.ROLLBACK_ON_FAILURE == 'true'
+        run: |
+          echo "::error::Production health checks failed – initiating rollback."
+          bash scripts/rollback.sh production "${{ steps.record.outputs.previous-sha }}"
+
+      - name: Notify on successful deployment
+        if: success()
+        run: |
+          bash scripts/notify.sh \
+            --level "success" \
+            --message "Production deployment SUCCEEDED for SHA ${{ github.sha }}" \
+            --webhook "${{ secrets.NOTIFY_WEBHOOK_URL }}"
+
+      - name: Notify on rollback
+        if: failure()
+        run: |
+          bash scripts/notify.sh \
+            --level "error" \
+            --message "Production deployment ROLLED BACK for SHA ${{ github.sha }}. Previous SHA: ${{ steps.record.outputs.previous-sha }}" \
+            --webhook "${{ secrets.NOTIFY_WEBHOOK_URL }}"
+
+  # ── Force rollback (manual trigger) ──────────────────────────────────────
+  force-rollback:
+    name: Force Rollback
+    runs-on: ubuntu-latest
+    if: github.event.inputs.force_rollback == 'true'
+    permissions:
+      contents: read
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Determine previous SHA
+        id: prev
+        run: |
+          PREV=$(git rev-parse HEAD~1)
+          echo "sha=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Rolling back to $PREV"
+
+      - name: Execute rollback
+        run: |
+          bash scripts/rollback.sh \
+            "${{ github.event.inputs.environment }}" \
+            "${{ steps.prev.outputs.sha }}"
+
+      - name: Notify
+        run: |
+          bash scripts/notify.sh \
+            --level "warning" \
+            --message "Manual rollback executed on ${{ github.event.inputs.environment }} to SHA ${{ steps.prev.outputs.sha }}" \
+            --webhook "${{ secrets.NOTIFY_WEBHOOK_URL }}"
