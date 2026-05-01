@@ -58,7 +58,7 @@ check_health() {
 # ── Main retry loop ───────────────────────────────────────────────────────────
 attempt=1
 while (( attempt <= RETRIES )); do
-  echo "[Attempt $attempt/$RETRIES] Checking $URL/health ..."
+  echo "[Attempt $attempt/$RETRIES] Checking ${URL}${HEALTH_PATH} ..."
 
   if check_health; then
     echo "✅ Health check PASSED on attempt $attempt"

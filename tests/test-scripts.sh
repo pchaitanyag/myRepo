@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/test-scripts.sh – Unit tests for self-healing pipeline scripts.
+# tests/test-scripts.sh - Unit tests for self-healing pipeline scripts.
 # Run with:  bash tests/test-scripts.sh
 # Requires:  bash 4+, curl (mocked via PATH override)
 
