@@ -25,6 +25,8 @@ jobs:
   install:
     name: Install dependencies
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       cache-hit: ${{ steps.cache.outputs.cache-hit }}
     steps:
@@ -60,6 +62,8 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     needs: install
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -85,6 +89,8 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     needs: install
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -119,6 +125,8 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     needs: [lint, build]
+    permissions:
+      contents: read
     outputs:
       tests-passed: ${{ steps.final-status.outputs.passed }}
     steps:
@@ -212,6 +220,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test, security]
     if: always()
+    permissions: {}
     steps:
       - name: Evaluate gate
         run: |

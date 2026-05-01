@@ -79,8 +79,8 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: self-heal/dep-scan-fix-${{ github.run_id }}
-          commit-message: "fix(deps): auto-fix ${{ steps.audit.outputs.vuln-count }} npm vulnerability/ies [skip ci]"
-          title: "🔒 Dependency Scan: Fix ${{ steps.audit.outputs.vuln-count }} vulnerability/ies"
+          commit-message: "fix(deps): auto-fix ${{ steps.audit.outputs.vuln-count }} npm vulnerabilities [skip ci]"
+          title: "🔒 Dependency Scan: Fix ${{ steps.audit.outputs.vuln-count }} vulnerabilities"
           body: |
             ## Automated Dependency Vulnerability Fix
 

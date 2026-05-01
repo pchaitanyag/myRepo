@@ -16,6 +16,7 @@ RETRIES=5
 INTERVAL=15
 SHA=""
 EXPECTED_STATUS=200
+HEALTH_PATH="/health"
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -25,6 +26,7 @@ while [[ $# -gt 0 ]]; do
     --interval)  INTERVAL="$2";        shift 2 ;;
     --sha)       SHA="$2";             shift 2 ;;
     --status)    EXPECTED_STATUS="$2"; shift 2 ;;
+    --path)      HEALTH_PATH="$2";     shift 2 ;;
     *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
@@ -48,7 +50,7 @@ check_health() {
   http_code=$(curl -s -o /dev/null -w "%{http_code}" \
     --connect-timeout 10 \
     --max-time 30 \
-    "$URL/health" 2>/dev/null) || return 1
+    "${URL}${HEALTH_PATH}" 2>/dev/null) || return 1
   echo "  → HTTP $http_code"
   [[ "$http_code" == "$EXPECTED_STATUS" ]]
 }
